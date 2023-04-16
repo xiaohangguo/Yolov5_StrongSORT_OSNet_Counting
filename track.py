@@ -35,7 +35,9 @@ from yolov5.utils.torch_utils import select_device, time_sync
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from strong_sort.utils.parser import get_config
 from strong_sort.strong_sort import StrongSORT
-
+from collections import deque,Counter
+from add_reid import *
+# from add_reid import *
 # remove duplicated stream handler to avoid duplicated logging
 logging.getLogger().removeHandler(logging.getLogger().handlers[0])
 
@@ -135,6 +137,23 @@ def run(
     model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources
+    # ***********************
+
+    paths = {}
+    track_cls = 0
+    last_track_id = -1
+    idx_frame = 0
+    results = []
+    already_counted = deque(maxlen=50)  # temporary memory for storing counted IDs
+    already_counted2 = deque(maxlen=50)  # temporary memory for storing counted IDs
+    total_track2 = 0
+    class_counter = Counter()  # store counts of each detected class
+    total_counter = 0
+    up_count = 0
+    down_count = 0
+    arrived_person = {}
+    new_id_dict, new_id_index = dict(), 0
+
     for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
@@ -184,6 +203,12 @@ def run(
             annotator = Annotator(im0, line_width=2, pil=not ascii)
             if cfg.STRONGSORT.ECC:  # camera motion compensation
                 strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
+            # ******************************
+            line = [(0, int(0.55 * im0.shape[0])),
+                    (int(im0.shape[1]), int(0.55 * im0.shape[0]))]  # 图像信息的三个通道
+
+            cv2.line(im0, line[0], line[1], (0, 255, 255), 4)
+            annotator = Annotator(im0, line_width=2, pil=not ascii)
 
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
@@ -203,6 +228,41 @@ def run(
                 outputs[i] = strongsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
                 t5 = time_sync()
                 dt[3] += t5 - t4
+
+                # 2统计人数
+                for track in outputs[0]:
+                    bbox = track[:4]
+                    track_id = track[4]
+                    midpoint = tlbr_bottom(bbox)
+                    origin_midpoint = (
+                        midpoint[0], im0.shape[0] - midpoint[1])  # get midpoint respective to botton-left获得相对于左下角的中点
+                    cv2.circle(im0, midpoint, 10, (0, 0, 255), -1)
+
+                    if track_id not in paths:
+                        paths[track_id] = deque(maxlen=2)
+                        total_track = track_id
+
+                    paths[track_id].append(midpoint)
+                    previous_midpoint = paths[track_id][0]
+                    origin_previous_midpoint = (previous_midpoint[0], im0.shape[0] - previous_midpoint[1])
+                    if intersect(midpoint, previous_midpoint, line[0],
+                                 line[1]) and track_id not in already_counted:  # 如果相交且行人从未没经过线
+                        class_counter[track_cls] += 1
+                        total_counter += 1
+                        last_track_id = track_id
+                        # draw red line 有人经过线变红
+                        total_track2 += 1
+                        cv2.line(im0, line[0], line[1], (0, 0, 255), 10)
+
+                        already_counted.append(track_id)  # Set already counted for ID to true.将已计算的 ID 设置为 true
+
+                        # 判断
+                        angle = vector_angle(origin_midpoint, origin_previous_midpoint)
+                        # 经过黄线，
+                        if angle > 0:
+                            up_count += 1
+                        if angle < 0:
+                            down_count += 1
 
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
@@ -241,7 +301,27 @@ def run(
 
             # Stream results
             im0 = annotator.result()
+
+            label = "走过黄线人数: {} (向上:{}, 向下:{})".format(str(total_counter), str(up_count), str(down_count))
+            t_size = get_size_with_pil(label, 25)
+            x1 = 20
+            y1 = 100
+            # color = compute_color_for_labels(2)
+            # cv2.rectangle(im0, (x1 - 1, y1), (x1 + t_size[0] + 10, y1 - t_size[1]), color, 2)
+            im0 = put_text_to_cv2_img_with_pil(im0, label, (x1 + 5, y1 - t_size[1] - 2), (255, 0, 0))
+
+            if last_track_id >= 0:
+                label = "行人{}号{}穿过黄线".format(str(last_track_id), str("向上") if angle >= 0 else str('向下'))
+                t_size = get_size_with_pil(label, 25)
+                x1 = 20
+                y1 = 150
+                # color = compute_color_for_labels(2)
+                # cv2.rectangle(ori_img, (x1 - 1, y1), (x1 + t_size[0] + 10, y1 - t_size[1]), color, 2)
+                im0 = put_text_to_cv2_img_with_pil(im0, label, (x1 + 5, y1 - t_size[1] - 2),
+                                                   (255, 0, 0))
             if show_vid:
+                cv2.putText(im0, f"{n} {names[int(c)]}{'s' * (n > 1)}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                            (0, 0, 255), 2)
                 cv2.imshow(str(p), im0)
                 cv2.waitKey(1)  # 1 millisecond
 
@@ -275,30 +355,30 @@ def run(
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--yolo-weights', nargs='+', type=str, default=WEIGHTS / 'yolov5m.pt', help='model.pt path(s)')
-    parser.add_argument('--strong-sort-weights', type=str, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
+    parser.add_argument('--yolo-weights', nargs='+', type=str, default=WEIGHTS / 'yolov5s.pt', help='model.pt path(s)')
+    parser.add_argument('--strong-sort-weights', type=str, default=WEIGHTS / 'osnet_x0_25_msmt17.pth')
     parser.add_argument('--config-strongsort', type=str, default='strong_sort/configs/strong_sort.yaml')
-    parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')  
+    parser.add_argument('--source', type=str, default=r'D:\yanyi\project_process\data\renliu/renliu2.mp4', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
     parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
+    parser.add_argument('--show-vid',default=True, action='store_true', help='display tracking video results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
     parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
     parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
     # class 0 is person, 1 is bycicle, 2 is car... 79 is oven
-    parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
+    parser.add_argument('--classes', default='0',nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--visualize', action='store_true', help='visualize features')
     parser.add_argument('--update', action='store_true', help='update all models')
     parser.add_argument('--project', default=ROOT / 'runs/track', help='save results to project/name')
     parser.add_argument('--name', default='exp', help='save results to project/name')
-    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
+    parser.add_argument('--exist-ok',default=True, action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--line-thickness', default=3, type=int, help='bounding box thickness (pixels)')
     parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
@@ -307,7 +387,6 @@ def parse_opt():
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
-    print_args(vars(opt))
     return opt
 
 

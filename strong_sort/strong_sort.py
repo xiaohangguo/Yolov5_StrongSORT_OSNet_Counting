@@ -27,7 +27,7 @@ class StrongSORT(object):
                 ):
         model_name = get_model_name(model_weights)
         model_url = get_model_url(model_weights)
-
+        print(model_weights)
         if not file_exists(model_weights) and model_url is not None:
             gdown.download(model_url, str(model_weights), quiet=False)
         elif file_exists(model_weights):
